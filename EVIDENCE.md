@@ -115,51 +115,55 @@ didn't even need to know about the new column.
 5. **Static-glibc (CGO) `scratch` build crashed the microVM** (`kernel crash:
    assertion error`). Switching the API image to pure-Go (`CGO_ENABLED=0`)
    dynamic-PIE on an `alpine` rootfs booted cleanly.
-6. **Stateful scale-to-zero + TLS Postgres did not wake reliably on connection.**
-   With `scale-to-zero policy=idle,stateful=true`, once the DB idled to `standby`,
-   incoming TLS connections failed with `SSL connection has been closed
-   unexpectedly` / `unexpected EOF` during the cold-wake window (both `psql` and the
-   API's pgx pool). A manual `unikraft instances start` brings it up fine, and it
-   works reliably while running. For the demo we ran the DB **always-on**. See the
-   investigation below for the likely cause.
+6. **Scale-to-zero breaks connections to a raw-`tls` Postgres endpoint — even while
+   the instance is running.** With `scale-to-zero` enabled on the `5432:5432/tls`
+   service, every TLS connection failed with `SSL connection has been closed
+   unexpectedly`, *including when the instance was fully `running` and Postgres had
+   logged `database system is ready to accept connections`*. Disabling scale-to-zero
+   (`--scale-to-zero policy=off`) on the **same instance/FQDN** made `psql` connect
+   instantly (`SUCCESS notes=2872`). Reproduced on a stable network — see the
+   investigation below for the isolation steps and root cause.
 
-## Investigation: why stateful scale-to-zero was failing
+## Investigation: why scale-to-zero broke Postgres connectivity (definitive)
 
-Checked against the [scale-to-zero](https://unikraft.com/docs/features/scale-to-zero)
-and [snapshots](https://unikraft.com/docs/features/snapshots) docs. This is **not a
-tier or account-level restriction** — stateful scale-to-zero is a standard feature.
-The behavior we hit comes from **how the wake works for the port handler in use**:
+Re-tested end-to-end on a **stable network** to get a conclusive answer. Ruled out,
+by direct test, every alternative explanation:
 
-- The docs' happy-path examples all expose an **`http`-handler** port
-  (`-p 443:8080/http+tls`). For HTTP ports, the proxy holds the incoming request
-  while the instance wakes (millisecond snapshot restore) and then serves it — the
-  client never sees the wake. The docs explicitly note the premature-scaledown /
-  first-response issue "is never the case for ports of your service that have the
-  `http` handler set."
-- Postgres is exposed on a **raw `tls` (plain TCP) port** (`5432:5432/tls`), which
-  has **no `http` handler**. For the `idle` policy the docs say established
-  connections stay open and *"incoming packets wake up the instance"* — i.e. the
-  first packet is consumed to trigger the wake. With a TLS handshake, that first
-  connection can therefore be dropped/reset while the snapshot restores, which is
-  exactly the `SSL connection has been closed unexpectedly` we observed. The
-  expected pattern for raw-TCP/TLS ports is **client-side connection retry**: the
-  first attempt wakes the instance, a subsequent attempt succeeds.
+| Hypothesis | Test | Result |
+| --- | --- | --- |
+| Poor network | Repeated on a good connection | Still failed identically |
+| Instance quota (`4/4`) | `unikraft metros -o json` + deployed a 5th instance | Limit is **16**, used 4; 5th deployed fine — ruled out |
+| Cold-wake race / short timeout | Single patient connection, 60–120s | Failed at ~11s; edge *actively closes* the connection |
+| Aggressive 1s cooldown scaling back mid-boot | Set cooldown to 30s, retested | Instance woke (`standby→running`) and Postgres logged `ready`, but connection **still failed** |
+| Boot not finished | Waited 20s post-wake; logs show PG `ready to accept connections` | Connection **still failed** while `running` + ready |
+| **Scale-to-zero itself** | Disabled it (`policy=off`) on the same instance/FQDN | **`psql` connected instantly: `SUCCESS notes=2872`** |
 
-**Why our retries still failed:** our retry loop did retry (5–6 attempts with
-backoff) and still failed every time. The most likely compounding factor is the
-**unstable network** this whole session ran on (it also caused Docker Hub TLS
-errors and failed volume uploads). On a stable connection, retry-after-wake is the
-documented and expected behavior for a TCP/TLS service.
+**Root cause (proven):** enabling scale-to-zero on a **raw `tls` / plain-TCP
+service** breaks the TLS connection at the edge — *independent of instance state*.
+Even with the instance `running` and Postgres ready, the edge closes the TLS
+handshake (`SSL connection has been closed unexpectedly`). Turning scale-to-zero
+**off** on the identical instance fixes it immediately.
+
+**Why:** the working scale-to-zero services in the account all expose an **`http`
+handler** (`443:8080/tls+http`); Postgres exposes **`tls` only** (`5432:5432/tls`).
+The edge's connection interception for scale-to-zero traffic/idle detection
+understands and safely proxies HTTP, but it interferes with the opaque raw-TLS
+stream — so the handshake is closed. This is a **handler-level limitation**, not a
+tier, quota, network, or timing issue. (Note: it also woke the instance correctly
+— `standby→running` was observed — so wake *triggering* works; it's the connection
+itself that the edge corrupts.)
 
 **Takeaways for the article / production use:**
-- Scale-to-zero for a Postgres (raw-TCP/TLS) endpoint is supported, but the client
-  **must** implement connection retry to absorb the cold-wake window — this is
-  by-design for non-`http` ports, not a bug.
-- The `pg_ukc_scaletozero` module handles *not scaling down mid-query*; it does not
-  remove the need for retry on the *initial* wake connection.
-- Alternatives: a warmer cooldown so the DB rarely idles, or reaching the DB over
-  the internal Private FQDN (which scale-to-zero also supports) from co-located app
-  instances.
+- As configured (public `tls` endpoint), **scale-to-zero and connectivity are
+  mutually exclusive** for this Postgres — you get one or the other. We ran the DB
+  **always-on** so the app works.
+- To actually get scale-to-zero *and* connectivity for a database, options to try:
+  reach it over the **internal Private FQDN** (plaintext, no edge TLS to corrupt)
+  from co-located app instances, or front it with an `http`-handled proxy. These
+  weren't validated here.
+- The public docs' Postgres guide shows `psql` working against a `5432/tls`
+  scale-to-zero instance; we could not reproduce that on this account/CLI version
+  — with scale-to-zero on, the `tls` connection is closed regardless of state.
 
 ## Cost comparison: scale-to-zero vs always-on managed Postgres
 
@@ -197,6 +201,13 @@ but at these sizes it's negligible. The savings scale with the number of idle
 databases — e.g. **one branch per open pull request**, each costing ~nothing while
 nobody is actively testing it, versus paying 24×7 for a fleet of mostly-idle
 managed instances.
+
+> **Important caveat (see investigation above):** these savings assume the
+> scale-to-zero DB is actually reachable. In our testing, enabling scale-to-zero on
+> the **public `tls` endpoint broke Postgres connectivity entirely** — so realizing
+> this cost model in practice requires reaching the DB another way (e.g. the internal
+> Private FQDN) or fronting it with an `http` handler. As-is over the public TLS
+> endpoint, you must choose **either** connectivity **or** scale-to-zero.
 
 ## Stateful persistence
 
