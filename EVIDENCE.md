@@ -11,6 +11,7 @@ Nothing here is paraphrased.
 - **API image:** `anonx/pg-branching-demo:latest`
 - **DB FQDN:** `falling-dawn-v7xqhodw.fra.unikraft.app`
 - **API FQDN:** `https://polished-star-c02tq06l.fra.unikraft.app`
+- **GitHub repo:** https://github.com/DesmondSanctity/pg-branching-unikraft
 
 ## Toolchain / dependencies
 
