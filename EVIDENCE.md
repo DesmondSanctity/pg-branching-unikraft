@@ -13,6 +13,24 @@ Nothing here is paraphrased.
 - **API FQDN:** `https://polished-star-c02tq06l.fra.unikraft.app`
 - **GitHub repo:** https://github.com/DesmondSanctity/pg-branching-unikraft
 
+## Scope note (for framing the article)
+
+The article's subject is **instance branching** — clone the DB's volume, test a risky
+migration on the isolated branch, fix it, then promote the fix to the real database.
+**This workflow does not depend on scale-to-zero in any way.** Branching is a volume
+clone; the migration test/fix/promote loop runs entirely against a normal running
+instance.
+
+To keep the story clean, **every branching and migration test in this log was run on
+an always-on DB instance** (scale-to-zero disabled). That's the only detail the
+article needs to mention about scale-to-zero — it's called out simply to avoid
+confusion, not because the feature is part of the demo.
+
+The separate scale-to-zero investigation further below is an **orthogonal finding**
+about a platform rough edge (scale-to-zero vs. a directly-accessed Postgres). It is
+optional context and **does not need to be in the article**; the branching narrative
+stands entirely on its own.
+
 ## Toolchain / dependencies
 
 - Go 1.24.1 (toolchain auto-upgrades to 1.25.x), Docker 27.5.1, Unikraft CLI 0.2.3
@@ -113,13 +131,13 @@ didn't even need to know about the new column.
 4. **The custom PG image has no `pgcrypto`.** `gen_random_uuid()` is built into
    PostgreSQL 13+, so the extension isn't needed — drop `CREATE EXTENSION pgcrypto`.
 5. **Static-glibc (CGO) `scratch` build crashed the microVM** (`kernel crash:
-   assertion error`). Switching the API image to pure-Go (`CGO_ENABLED=0`)
+assertion error`). Switching the API image to pure-Go (`CGO_ENABLED=0`)
    dynamic-PIE on an `alpine` rootfs booted cleanly.
 6. **Scale-to-zero breaks connections to a raw-`tls` Postgres endpoint — even while
    the instance is running.** With `scale-to-zero` enabled on the `5432:5432/tls`
    service, every TLS connection failed with `SSL connection has been closed
-   unexpectedly`, *including when the instance was fully `running` and Postgres had
-   logged `database system is ready to accept connections`*. Disabling scale-to-zero
+unexpectedly`, _including when the instance was fully `running` and Postgres had
+   logged `database system is ready to accept connections`_. Disabling scale-to-zero
    (`--scale-to-zero policy=off`) on the **same instance/FQDN** made `psql` connect
    instantly (`SUCCESS notes=2872`). Reproduced on a stable network — see the
    investigation below for the isolation steps and root cause.
@@ -129,17 +147,17 @@ didn't even need to know about the new column.
 Re-tested end-to-end on a **stable network** to get a conclusive answer. Ruled out,
 by direct test, every alternative explanation:
 
-| Hypothesis | Test | Result |
-| --- | --- | --- |
-| Poor network | Repeated on a good connection | Still failed identically |
-| Instance quota (`4/4`) | `unikraft metros -o json` + deployed a 5th instance | Limit is **16**, used 4; 5th deployed fine — ruled out |
-| Cold-wake race / short timeout | Single patient connection, 60–120s | Failed at ~11s; edge *actively closes* the connection |
-| Aggressive 1s cooldown scaling back mid-boot | Set cooldown to 30s, retested | Instance woke (`standby→running`) and Postgres logged `ready`, but connection **still failed** |
-| Boot not finished | Waited 20s post-wake; logs show PG `ready to accept connections` | Connection **still failed** while `running` + ready |
-| **Scale-to-zero itself** | Disabled it (`policy=off`) on the same instance/FQDN | **`psql` connected instantly: `SUCCESS notes=2872`** |
+| Hypothesis                                   | Test                                                             | Result                                                                                         |
+| -------------------------------------------- | ---------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| Poor network                                 | Repeated on a good connection                                    | Still failed identically                                                                       |
+| Instance quota (`4/4`)                       | `unikraft metros -o json` + deployed a 5th instance              | Limit is **16**, used 4; 5th deployed fine — ruled out                                         |
+| Cold-wake race / short timeout               | Single patient connection, 60–120s                               | Failed at ~11s; edge _actively closes_ the connection                                          |
+| Aggressive 1s cooldown scaling back mid-boot | Set cooldown to 30s, retested                                    | Instance woke (`standby→running`) and Postgres logged `ready`, but connection **still failed** |
+| Boot not finished                            | Waited 20s post-wake; logs show PG `ready to accept connections` | Connection **still failed** while `running` + ready                                            |
+| **Scale-to-zero itself**                     | Disabled it (`policy=off`) on the same instance/FQDN             | **`psql` connected instantly: `SUCCESS notes=2872`**                                           |
 
 **Root cause (proven):** enabling scale-to-zero on a **raw `tls` / plain-TCP
-service** breaks the TLS connection at the edge — *independent of instance state*.
+service** breaks the TLS connection at the edge — _independent of instance state_.
 Even with the instance `running` and Postgres ready, the edge closes the TLS
 handshake (`SSL connection has been closed unexpectedly`). Turning scale-to-zero
 **off** on the identical instance fixes it immediately.
@@ -150,44 +168,46 @@ The edge's connection interception for scale-to-zero traffic/idle detection
 understands and safely proxies HTTP, but it interferes with the opaque raw-TLS
 stream — so the handshake is closed. This is a **handler-level limitation**, not a
 tier, quota, network, or timing issue. (Note: it also woke the instance correctly
-— `standby→running` was observed — so wake *triggering* works; it's the connection
+— `standby→running` was observed — so wake _triggering_ works; it's the connection
 itself that the edge corrupts.)
 
 **App-path test — does an HTTP app wake a scale-to-zero DB over the private network?**
 The realistic production pattern is an `http`-fronted API talking to the DB
-*internally* (no public edge TLS to corrupt). We deployed the API co-located with a
+_internally_ (no public edge TLS to corrupt). We deployed the API co-located with a
 scale-to-zero DB and tested both internal addressing modes while the DB sat in
 `standby`:
 
-| App → DB path | DSN | Result | DB state |
-| --- | --- | --- | --- |
-| Internal Private FQDN | `pgdemo-db.internal:5432?sslmode=disable` | `hostname resolving error: lookup pgdemo-db.internal ... no such host` | stayed `standby` |
-| Direct private IP (plaintext) | `10.0.7.181:5432?sslmode=disable` | `dial tcp 10.0.7.181:5432: connect: software caused connection abort` | **stayed `standby` — never woke** |
+| App → DB path                 | DSN                                       | Result                                                                 | DB state                          |
+| ----------------------------- | ----------------------------------------- | ---------------------------------------------------------------------- | --------------------------------- |
+| Internal Private FQDN         | `pgdemo-db.internal:5432?sslmode=disable` | `hostname resolving error: lookup pgdemo-db.internal ... no such host` | stayed `standby`                  |
+| Direct private IP (plaintext) | `10.0.7.181:5432?sslmode=disable`         | `dial tcp 10.0.7.181:5432: connect: software caused connection abort`  | **stayed `standby` — never woke** |
 
 Two conclusions, both definitive:
+
 - The `<name>.internal` private FQDN **does not resolve** for cross-instance traffic
   on this account/CLI version, so the documented "reach it over the Private FQDN"
   workaround isn't available as-is.
 - Connecting **directly to the DB's private IP bypasses the public edge proxy** — and
-  that proxy is *where the scale-to-zero wake trigger lives*. The packet reaches the
+  that proxy is _where the scale-to-zero wake trigger lives_. The packet reaches the
   network but the standby instance never wakes (it stayed `standby` across every
   attempt) and the dial is aborted. **Wake is a property of the published service
   edge, not the private network.**
 
 **Takeaways for the article / production use:**
+
 - As configured (public `tls` endpoint), **scale-to-zero and connectivity are
   mutually exclusive** for this Postgres — you get one or the other. We ran the DB
   **always-on** so the app works.
 - The wake trigger only fires at the **public edge**, and the public edge only
   handles the raw-`tls` Postgres stream in a way that **corrupts the connection**.
-  The private path that *wouldn't* corrupt the stream (direct IP) **can't wake the
+  The private path that _wouldn't_ corrupt the stream (direct IP) **can't wake the
   instance**. So there is no working "app wakes a scale-to-zero Postgres" path on
   this account/CLI version — via public FQDN (TLS closed) or private IP (no wake).
 - The public docs' Postgres guide shows `psql` working against a `5432/tls`
   scale-to-zero instance; we could not reproduce that on this account/CLI version
   — with scale-to-zero on, the `tls` connection is closed regardless of state.
-- **Bottom line for the piece:** *branching (volume clone) is the real, working,
-  ship-it feature.* Scale-to-zero for a directly-accessed Postgres is not usable in
+- **Bottom line for the piece:** _branching (volume clone) is the real, working,
+  ship-it feature._ Scale-to-zero for a directly-accessed Postgres is not usable in
   current Unikraft Cloud; the working demo runs the DB always-on.
 
 ## Cost comparison: scale-to-zero vs always-on managed Postgres
@@ -205,21 +225,21 @@ branch/preview databases**, which sit idle the vast majority of the time.
 
 **Always-on baseline (real published rates, ~2026):**
 
-| Option | Spec | Approx. monthly (compute, 24×7) |
-| --- | --- | --- |
+| Option                                                      | Spec                | Approx. monthly (compute, 24×7)                         |
+| ----------------------------------------------------------- | ------------------- | ------------------------------------------------------- |
 | AWS RDS PostgreSQL `db.t4g.micro` (on-demand, eu-central-1) | 2 vCPU burst, 1 GiB | ~$0.018/hr × 730h ≈ **$13/mo** + storage (~$0.12/GB-mo) |
-| Supabase Pro | shared | **$25/mo** flat |
-| Neon / scale-to-zero DBaaS | — | not an "always-on" comparison (also scales to zero) |
+| Supabase Pro                                                | shared              | **$25/mo** flat                                         |
+| Neon / scale-to-zero DBaaS                                  | —                   | not an "always-on" comparison (also scales to zero)     |
 
 **The idle math (this is the point):** a dev/test or per-branch database is
 typically active only a small fraction of the day. If it does ~2 hours of real work
 per day (≈ 60 running hours/month) and is idle the rest:
 
-| | Always-on RDS `db.t4g.micro` | Scale-to-zero (billed only while running) |
-| --- | --- | --- |
-| Compute hours billed / mo | 730 h | ~60 h |
-| Relative compute cost | 100% | **~8%** (≈ **92% saved**) |
-| Idle cost | full | **~0** (only volume storage remains) |
+|                           | Always-on RDS `db.t4g.micro` | Scale-to-zero (billed only while running) |
+| ------------------------- | ---------------------------- | ----------------------------------------- |
+| Compute hours billed / mo | 730 h                        | ~60 h                                     |
+| Relative compute cost     | 100%                         | **~8%** (≈ **92% saved**)                 |
+| Idle cost                 | full                         | **~0** (only volume storage remains)      |
 
 The persistent volume (256 MiB here) is billed whether or not the instance runs,
 but at these sizes it's negligible. The savings scale with the number of idle
