@@ -153,17 +153,42 @@ tier, quota, network, or timing issue. (Note: it also woke the instance correctl
 — `standby→running` was observed — so wake *triggering* works; it's the connection
 itself that the edge corrupts.)
 
+**App-path test — does an HTTP app wake a scale-to-zero DB over the private network?**
+The realistic production pattern is an `http`-fronted API talking to the DB
+*internally* (no public edge TLS to corrupt). We deployed the API co-located with a
+scale-to-zero DB and tested both internal addressing modes while the DB sat in
+`standby`:
+
+| App → DB path | DSN | Result | DB state |
+| --- | --- | --- | --- |
+| Internal Private FQDN | `pgdemo-db.internal:5432?sslmode=disable` | `hostname resolving error: lookup pgdemo-db.internal ... no such host` | stayed `standby` |
+| Direct private IP (plaintext) | `10.0.7.181:5432?sslmode=disable` | `dial tcp 10.0.7.181:5432: connect: software caused connection abort` | **stayed `standby` — never woke** |
+
+Two conclusions, both definitive:
+- The `<name>.internal` private FQDN **does not resolve** for cross-instance traffic
+  on this account/CLI version, so the documented "reach it over the Private FQDN"
+  workaround isn't available as-is.
+- Connecting **directly to the DB's private IP bypasses the public edge proxy** — and
+  that proxy is *where the scale-to-zero wake trigger lives*. The packet reaches the
+  network but the standby instance never wakes (it stayed `standby` across every
+  attempt) and the dial is aborted. **Wake is a property of the published service
+  edge, not the private network.**
+
 **Takeaways for the article / production use:**
 - As configured (public `tls` endpoint), **scale-to-zero and connectivity are
   mutually exclusive** for this Postgres — you get one or the other. We ran the DB
   **always-on** so the app works.
-- To actually get scale-to-zero *and* connectivity for a database, options to try:
-  reach it over the **internal Private FQDN** (plaintext, no edge TLS to corrupt)
-  from co-located app instances, or front it with an `http`-handled proxy. These
-  weren't validated here.
+- The wake trigger only fires at the **public edge**, and the public edge only
+  handles the raw-`tls` Postgres stream in a way that **corrupts the connection**.
+  The private path that *wouldn't* corrupt the stream (direct IP) **can't wake the
+  instance**. So there is no working "app wakes a scale-to-zero Postgres" path on
+  this account/CLI version — via public FQDN (TLS closed) or private IP (no wake).
 - The public docs' Postgres guide shows `psql` working against a `5432/tls`
   scale-to-zero instance; we could not reproduce that on this account/CLI version
   — with scale-to-zero on, the `tls` connection is closed regardless of state.
+- **Bottom line for the piece:** *branching (volume clone) is the real, working,
+  ship-it feature.* Scale-to-zero for a directly-accessed Postgres is not usable in
+  current Unikraft Cloud; the working demo runs the DB always-on.
 
 ## Cost comparison: scale-to-zero vs always-on managed Postgres
 
