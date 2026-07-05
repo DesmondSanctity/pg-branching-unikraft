@@ -1,0 +1,13 @@
+spec: v0.6
+
+runtime: base:latest
+rootfs: ./Dockerfile
+
+cmd: ["/api"]
+
+# DATABASE_URL is passed at deploy time via `unikraft run -e DATABASE_URL=...`,
+
+# never committed (it contains the DB password).
+
+env:
+PORT: "8080"
