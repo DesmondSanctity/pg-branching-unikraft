@@ -34,7 +34,7 @@ func main() {
 			log.Fatalf("insert tenant: %v", err)
 		}
 
-		n := 10 + rand.Intn(191) // 10..200 inclusive
+		n := noteCount()
 		batch := make([][]any, 0, n)
 		for j := 0; j < n; j++ {
 			batch = append(batch, []any{
@@ -56,6 +56,12 @@ func main() {
 	}
 
 	log.Printf("seed complete: %d tenants, %d notes total", tenantCount, totalNotes)
+}
+
+// noteCount returns a randomized per-tenant note count in the inclusive range
+// 10..200, so the seeded data is deliberately uneven.
+func noteCount() int {
+	return 10 + rand.Intn(191)
 }
 
 func randCompany() string {
