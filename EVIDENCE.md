@@ -9,8 +9,8 @@ Nothing here is paraphrased.
 - **Account/profile:** `anonx`
 - **DB image:** `anonx/pg-branching-demo-db:latest` (PostgreSQL 16.4 from source + `pg_ukc_scaletozero`)
 - **API image:** `anonx/pg-branching-demo:latest`
-- **DB FQDN:** `falling-dawn-v7xqhodw.fra.unikraft.app`
-- **API FQDN:** `https://polished-star-c02tq06l.fra.unikraft.app`
+- **DB FQDN:** `<your-db-fqdn>.fra.unikraft.app`
+- **API FQDN:** `https://<your-api-fqdn>.fra.unikraft.app`
 - **GitHub repo:** https://github.com/DesmondSanctity/pg-branching-unikraft
 
 ## Scope note (for framing the article)
